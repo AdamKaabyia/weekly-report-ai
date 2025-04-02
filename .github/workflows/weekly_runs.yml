@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          ref: main      # Specify the branch you want to check out
+          ref: ${{ github.ref }}      # Specify the branch you want to check out
           fetch-depth: 1 # Shallow clone for faster checkouts
 
       - name: Set up Python
