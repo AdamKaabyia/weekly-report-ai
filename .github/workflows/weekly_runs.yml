@@ -3,7 +3,12 @@ name: Weekly PR Summary
 on:
   schedule:
     - cron: '0 0 * * MON'  # Runs every Monday at midnight UTC
-  workflow_dispatch:  # Allows manual triggering
+  workflow_dispatch:
+    inputs:
+      summary_type:
+        description: 'Type of summary to generate (e.g., detailed or brief)'
+        required: false
+        default: 'detailed'
 
 jobs:
   summary:
@@ -14,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}      # Specify the branch you want to check out
-          fetch-depth: 1 # Shallow clone for faster checkouts
+          fetch-depth: 1              # Shallow clone for faster checkouts
 
       - name: Set up Python
         uses: actions/setup-python@v4
