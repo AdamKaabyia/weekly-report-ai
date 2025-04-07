@@ -49,7 +49,7 @@ def generate_markdown(prs, start_date, end_date):
     return md
 
 
-def generate_openai_summary(report_md,client):
+def generate_openai_summary(report_md, client, prompt):
     """
     Uses OpenAI's Chat Completion API to generate a concise summary of the weekly PR report.
 
@@ -59,11 +59,7 @@ def generate_openai_summary(report_md,client):
     Returns:
         A string containing the concise summary.
     """
-    prompt = (
-        "Generate a concise summary of the following weekly PR report. "
-        "Focus on the key insights and overall activity trends:\n\n"
-        f"{report_md}\n\nSummary:"
-    )
+
     response = client.chat.completions.create(model="gpt-3.5-turbo",  # or "gpt-4" if preferred
     messages=[
         {"role": "system", "content": "You are a helpful assistant that summarizes weekly PR reports."},
@@ -74,7 +70,7 @@ def generate_openai_summary(report_md,client):
     summary = response.choices[0].message.content.strip()
     return summary
 
-def process_repo_group(repo_full_name, pr_list, start_date_str, end_date_str,client):
+def process_repo_group(repo_full_name, pr_list, start_date_str, end_date_str, client, prompt):
     """
     Processes a single repository group (PRs from one repository) by generating a detailed Markdown
     report, obtaining an OpenAI-generated concise summary, and writing the results to a README file.
@@ -84,6 +80,8 @@ def process_repo_group(repo_full_name, pr_list, start_date_str, end_date_str,cli
         pr_list (list): List of PR items for this repository.
         start_date_str (str): Start date (YYYY-MM-DD).
         end_date_str (str): End date (YYYY-MM-DD).
+        prompt (str): input to llm model.
+        client (object): llm model
     """
     print(f"\nProcessing repository: {repo_full_name}")
     if not pr_list:
@@ -91,8 +89,9 @@ def process_repo_group(repo_full_name, pr_list, start_date_str, end_date_str,cli
         return
 
     detailed_report = generate_markdown(pr_list, start_date_str, end_date_str)
+
     print("Generating concise summary using OpenAI...")
-    concise_summary = generate_openai_summary(detailed_report,client)
+    concise_summary = generate_openai_summary(detailed_report,client, prompt=prompt)
 
     content = f"# Weekly PR Summary for {repo_full_name}\n\n"
     content += f"## Concise Summary\n\n{concise_summary}\n\n"

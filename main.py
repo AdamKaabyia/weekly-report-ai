@@ -5,11 +5,13 @@ import datetime
 import time
 from collections import defaultdict
 from openai import OpenAI
+import argparse
 
 
 from dotenv import load_dotenv
 
 from data_gathering import fetch_all_prs_by_user
+from generate_prompt import generate_dynamic_prompt
 from generate_summary import process_repo_group
 
 load_dotenv()
@@ -35,15 +37,22 @@ def get_date_range():
     last_week_end = today - datetime.timedelta(days=1)
     return last_week_start, last_week_end
 
-
-
-
-
 def main():
     # Set the GitHub username here
-    username = "adamkaabyia"
+    username = os.getenv("USERNAME")
 
+    parser = argparse.ArgumentParser(description="Generate a prompt for summarizing GitHub activity."
+                                                 "Please choose one option: timeframe, emphasis, detail, focus, concise")
 
+    parser.add_argument("--emphasis", choices=["impact", "key features"], help="The emphasis of the summary")
+    parser.add_argument("--detail", choices=["list repositories", "briefly describe"], help="The desired level of detail")
+    parser.add_argument("--focus", choices=["learning and development"], help="The specific focus of the summary")
+    parser.add_argument("--concise", action="store_true", help="Generate a concise summary")
+
+    args = parser.parse_args()
+
+    print("Generating concise prompt...")
+    prompt = generate_dynamic_prompt(args.emphasis, args.detail, args.focus, args.concise)
 
     # Determine last week's date range
     last_week_start, last_week_end = get_date_range()
@@ -69,7 +78,7 @@ def main():
 
     # Process each repository group
     for repo_full_name, pr_list in prs_by_repo.items():
-        process_repo_group(repo_full_name, pr_list, start_date_str, end_date_str,client)
+        process_repo_group(repo_full_name, pr_list, start_date_str, end_date_str, client, prompt)
         time.sleep(3)  # Pause to help avoid rate limits
 
 
