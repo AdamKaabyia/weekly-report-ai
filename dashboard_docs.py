@@ -2,296 +2,216 @@ import os
 import time
 import requests
 import datetime
-import logging
+
 import json
 import re
 from collections import defaultdict
 from dotenv import load_dotenv
 
+from MAAS import generate_overall_summary, generate_pr_detailed_summary
+from github_api import get_pr_status, get_authenticated_username, fetch_all_prs_by_user
+from logger import logger
+
 load_dotenv()
 
-# Configure logger
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
 
-# Granite API endpoint (provided by your Granite service)
-GRANITE_ENDPOINT = os.getenv("GRANITE_ENDPOINT")
-if not GRANITE_ENDPOINT:
-    logger.error("GRANITE_ENDPOINT is not set. Exiting.")
-    exit(1)
-
-# GitHub token for GitHub API calls
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-if not GITHUB_TOKEN:
-    logger.error("GITHUB_TOKEN is not set. Exiting.")
-    exit(1)
-
-# Load the email to share with from environment variable
+# Email to share the doc with
 SHARE_EMAIL = os.getenv("SHARE_EMAIL")
 if not SHARE_EMAIL:
     logger.error("SHARE_EMAIL is not set. Exiting.")
     exit(1)
 
 
-def get_authenticated_username():
-    """Fetches the username of the authenticated user from GitHub."""
-    url = "https://api.github.com/user"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"token {GITHUB_TOKEN}"
-    }
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        username = response.json().get("login")
-        if username:
-            logger.info(f"Authenticated as: {username}")
-            return username
-    logger.error("Failed to fetch authenticated user info from GitHub")
-    exit(1)
-
-
 def get_date_range():
-    """
-    Computes the start and end dates.
-    For testing, the start date is set to 1 day ago and the end date to today.
-    (Change the timedelta to 7 days for production.)
-    Returns a tuple (start_date, end_date) as datetime.date objects.
-    """
+    """Compute date range: 1 day ago to today (for testing)."""
     today = datetime.datetime.now().date()
-    last_week_start = today - datetime.timedelta(days=1)  # TODO: Change to 7 days for production
-    last_week_end = today
-    logger.info(f"Calculated date range: {last_week_start} to {last_week_end}")
-    return last_week_start, last_week_end
+    last_date = today - datetime.timedelta(days=7)
+    logger.info(f"Calculated date range: {last_date} to {today}")
+    return last_date, today
 
 
-def fetch_all_prs_by_user(username, start_date, end_date):
-    """Fetches all pull requests created by the given user in the specified date range."""
-    headers = {"Accept": "application/vnd.github+json",
-               "Authorization": f"token {GITHUB_TOKEN}"}
-    query = f"is:pr author:{username} created:{start_date}..{end_date}"
-    url = "https://api.github.com/search/issues"
-    prs = []
-    page = 1
-    per_page = 100
-    while True:
-        params = {"q": query, "per_page": per_page, "page": page}
-        logger.info(f"Fetching page {page} of PRs for user {username} with query: {query}")
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 403:
-            logger.warning("Rate limit exceeded. Sleeping for 60 seconds...")
-            time.sleep(60)
-            continue
-        elif response.status_code != 200:
-            logger.error(f"Error fetching PRs: {response.status_code} {response.text}")
-            break
-        data = response.json()
-        items = data.get("items", [])
-        logger.debug(f"Retrieved {len(items)} PRs on page {page}.")
-        prs.extend(items)
-        if len(items) < per_page:
-            logger.info("Last page reached.")
-            break
-        page += 1
-    logger.info(f"Total PRs fetched: {len(prs)}")
-    return prs
 
 
-def get_pr_status(pr):
-    """Determines the status of a pull request: 'open', 'closed', or 'merged'."""
-    pr_number = pr.get("number", "unknown")
-    status = pr.get("state", "unknown")
-    logger.debug(f"PR #{pr_number}: Initial state is '{status}'.")
-    if status == "closed" and "pull_request" in pr:
-        pr_url = pr["pull_request"].get("url")
-        if pr_url:
-            headers = {"Accept": "application/vnd.github+json",
-                       "Authorization": f"token {GITHUB_TOKEN}"}
-            resp = requests.get(pr_url, headers=headers)
-            if resp.status_code == 200:
-                pr_details = resp.json()
-                if pr_details.get("merged_at"):
-                    logger.debug(f"PR #{pr_number} is merged.")
-                    return "merged"
-                else:
-                    logger.debug(f"PR #{pr_number} is closed but not merged.")
-                    return "closed"
-            else:
-                logger.warning(f"Failed to get status for PR #{pr_number}. Returning 'closed'.")
-                return "closed"
-    logger.debug(f"PR #{pr_number}: Final status is '{status}'.")
-    return status
-
-
-def generate_pr_detailed_summary(pr):
-    """Uses the Granite API to generate a detailed summary for a single PR."""
-    pr_number = pr.get("number", "unknown")
-    title = pr.get("title", "No title")
-    body = pr.get("body", "No description provided.")
-    logger.info(f"Generating detailed summary for PR #{pr_number}: '{title}'")
-    prompt = (
-        "You are a knowledgeable code and workflow analyst. "
-        "Summarize the following pull request in detail, highlighting its purpose, changes, and notable insights. "
-        "Include any actionable observations.\n\n"
-        f"Title: {title}\n\n"
-        f"Body: {body}\n\n"
-        "Detailed Summary:"
-    )
-    payload = {
-        "model": "granite-8b-code-instruct-128k",
-        "prompt": prompt,
-        "max_tokens": 200,
-        "temperature": 0.7
-    }
-    granite_token = os.getenv("GRANITE_TOKEN")
-    if not granite_token:
-        logger.error("GRANITE_TOKEN is not set. Exiting.")
-        return ""
-    headers_payload = {"Content-Type": "application/json",
-                       "Authorization": f"Bearer {granite_token}"}
-    response = requests.post(GRANITE_ENDPOINT, headers=headers_payload, json=payload)
-    if response.status_code == 200:
-        summary = response.json().get("choices", [{}])[0].get("text", "").strip()
-        logger.debug(f"Received detailed summary for PR #{pr_number}.")
-        return summary
-    else:
-        logger.error(f"Error calling Granite API for PR #{pr_number}: {response.status_code} {response.text}")
-        return ""
-
-
-def generate_overall_summary(prs):
+def generate_user_summary_bullets(prs):
     """
-    Generates an AI-based overall summary of all PRs using the Granite API.
-    Aggregates PR titles and statuses, then sends a prompt to summarize.
+    Return a list of bullet lines for user summary.
+    e.g. ["AdamKaabyia: 5 PRs", "bob: 2 PRs", ...]
     """
-    pr_list = []
-    for pr in prs:
-        title = pr.get("title", "No title")
-        status = get_pr_status(pr)
-        pr_list.append(f"- {title} ({status})")
-    pr_summary_text = "\n".join(pr_list)
-    prompt = (
-            "You are a professional technical writer. Summarize the following list of pull requests into a concise overall summary "
-            "that captures the key changes and their impact. Here are the PRs:\n\n" +
-            pr_summary_text +
-            "\n\nOverall Summary:"
-    )
-    payload = {
-        "model": "granite-8b-code-instruct-128k",
-        "prompt": prompt,
-        "max_tokens": 150,
-        "temperature": 0.7
-    }
-    granite_token = os.getenv("GRANITE_TOKEN")
-    if not granite_token:
-        logger.error("GRANITE_TOKEN is not set. Exiting.")
-        return "Overall summary unavailable."
-    headers_payload = {"Content-Type": "application/json",
-                       "Authorization": f"Bearer {granite_token}"}
-    response = requests.post(GRANITE_ENDPOINT, headers=headers_payload, json=payload)
-    if response.status_code == 200:
-        overall = response.json().get("choices", [{}])[0].get("text", "").strip()
-        logger.info("Generated overall summary via AI.")
-        return overall
-    else:
-        logger.error(f"Error generating overall summary: {response.status_code} {response.text}")
-        return "Overall summary unavailable."
-
-
-def generate_user_summary_table(prs):
-    """
-    Builds a 2D list for the 'Summary by User' table.
-    """
-    header = ["User", "PR Count"]
-    rows = [header]
     user_counts = defaultdict(int)
     for pr in prs:
         user = pr.get("user", {}).get("login", "unknown")
         user_counts[user] += 1
+    bullets = []
     for user, count in user_counts.items():
-        rows.append([user, str(count)])
-    return rows
+        bullets.append(f"{user}: {count} PR(s)")
+    return bullets
 
 
-def generate_dashboard_table(prs, start_date, end_date):
+def generate_dashboard_bullets(prs):
     """
-    Builds a 2D list for the dashboard table.
+    Return a list of bullet lines for the PR dashboard, e.g.:
+    [
+      "rh-ecosystem-edge/nvidia-ci (#146) - Title: [WIP] Refactor ... - Author: X - Created: ... - Status: open",
+      ...
+    ]
     """
-    header = ["Repo", "PR Number", "Title", "Author", "Created At", "Status"]
-    rows = [header]
+    bullets = []
     for pr in prs:
         repo_url = pr.get("repository_url", "")
         repo = "/".join(repo_url.split("/")[-2:]) if repo_url else "unknown"
-        number = pr.get("number", "")
-        title = pr.get("title", "")
+        number = pr.get("number", "N/A")
+        title = pr.get("title", "No Title")
         user = pr.get("user", {}).get("login", "unknown")
-        created_at = pr.get("created_at", "")
+        created_at = pr.get("created_at", "N/A")
         status = get_pr_status(pr)
-        rows.append([repo, str(number), title, user, created_at, status])
-    return rows
+        bullets.append(f"{repo} (#{number}) - \"{title}\" - {user} - {created_at} - {status}")
+    return bullets
 
 
-def generate_detailed_pr_summaries(prs):
+def create_bullet_lines(lines, start_index):
     """
-    Generates detailed summaries for each PR with separate headings.
-    Each summary is generated via the Granite API and collected as plain text.
+    Insert lines at start_index, then createParagraphBullets on that range.
+    Returns (requests, new_end_index).
     """
-    logger.info("Generating detailed summaries for each PR...")
-    summaries = ""
+    requests = []
+    current_index = start_index
+    text_block = ""
+    for line in lines:
+        text_block += line + "\n"
+    # Insert all lines at once
+    insert_req = {
+        "insertText": {
+            "location": {"index": current_index},
+            "text": text_block
+        }
+    }
+    requests.append(insert_req)
+    lines_length = len(text_block)
+
+    # Then apply bullets to all those lines at once
+    # We'll bullet from current_index to current_index + lines_length - 1
+    # But we must ensure we skip the trailing newline.
+    bullet_req = {
+        "createParagraphBullets": {
+            "range": {
+                "startIndex": current_index,
+                "endIndex": current_index + lines_length - 1
+            },
+            "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE"
+        }
+    }
+    requests.append(bullet_req)
+    return requests, current_index + lines_length
+
+
+def generate_detailed_pr_summaries_section(prs, start_index):
+    """
+    Create requests to insert "Detailed PR Summaries" heading (as a heading style),
+    then each PR summary as a sub-heading (HEADING_3), plus normal text.
+    Returns (list_of_requests, new_index).
+    """
+    requests = []
+    current_index = start_index
+
+    # Insert a heading for "Detailed PR Summaries"
+    heading_text = "Detailed PR Summaries"
+    # Insert heading text
+    insert_req = {
+        "insertText": {
+            "location": {"index": current_index},
+            "text": heading_text + "\n"
+        }
+    }
+    requests.append(insert_req)
+    # Apply heading style
+    heading_len = len(heading_text) + 1
+    requests.append({
+        "updateParagraphStyle": {
+            "range": {
+                "startIndex": current_index,
+                "endIndex": current_index + heading_len
+            },
+            "paragraphStyle": {"namedStyleType": "HEADING_1"},
+            "fields": "namedStyleType"
+        }
+    })
+    current_index += heading_len
+
+    # Insert each PR summary as a subheading
     for pr in prs:
-        number = pr.get("number", "unknown")
+        number = pr.get("number", "N/A")
         title = pr.get("title", "No Title")
         pr_url = pr.get("html_url", "")
-        heading = f"PR {number}: {title}"
+        heading_line = f"PR #{number}: {title}"
         if pr_url:
-            heading += f" (Link: {pr_url})"
-        detailed_summary = generate_pr_detailed_summary(pr)
-        summaries += f"{heading}\n\n{detailed_summary}\n\n{'-' * 40}\n\n"
-        time.sleep(1)  # Pause to avoid rate limits
-    logger.info("Detailed PR summaries generated.")
-    return summaries
+            heading_line += f" (Link: {pr_url})"
+        summary_text = generate_pr_detailed_summary(pr)
 
+        # Insert subheading
+        insert_heading_req = {
+            "insertText": {
+                "location": {"index": current_index},
+                "text": heading_line + "\n"
+            }
+        }
+        requests.append(insert_heading_req)
+        heading_len2 = len(heading_line) + 1
+        # Apply subheading style (HEADING_3)
+        requests.append({
+            "updateParagraphStyle": {
+                "range": {
+                    "startIndex": current_index,
+                    "endIndex": current_index + heading_len2
+                },
+                "paragraphStyle": {"namedStyleType": "HEADING_3"},
+                "fields": "namedStyleType"
+            }
+        })
+        current_index += heading_len2
 
-def build_plain_table_string(table_data):
-    """
-    Converts table_data (a list of lists) into a plain text table string with columns padded.
-    """
-    # Determine the maximum width for each column.
-    col_widths = []
-    for col in zip(*table_data):
-        max_width = max(len(str(cell)) for cell in col)
-        col_widths.append(max_width)
+        # Insert summary text
+        text_req = {
+            "insertText": {
+                "location": {"index": current_index},
+                "text": summary_text + "\n\n"
+            }
+        }
+        requests.append(text_req)
+        current_index += len(summary_text) + 2
 
-    lines = []
-    # Build header row.
-    header = " | ".join(str(cell).ljust(width) for cell, width in zip(table_data[0], col_widths))
-    separator = "-+-".join("-" * width for width in col_widths)
-    lines.append(header)
-    lines.append(separator)
-
-    # Build the rest of the rows.
-    for row in table_data[1:]:
-        line = " | ".join(str(cell).ljust(width) for cell, width in zip(row, col_widths))
-        lines.append(line)
-
-    return "\n".join(lines)
+    return requests, current_index
 
 
 def insert_plain_text_request(text, start_index):
     """
     Returns a tuple (request, length) to insert plain text at a given index.
+
+    Args:
+        text (str): The text to insert.
+        start_index (int): The position in the document (character index) where the text should be inserted.
+
+    Returns:
+        tuple: A tuple containing:
+            - The request dictionary formatted for the Google Docs API.
+            - The length of the inserted text (including a newline character).
     """
+    # Create the request with a newline added at the end.
     req = {"insertText": {"location": {"index": start_index}, "text": text + "\n"}}
-    return req, len(text) + 1
+    # Calculate the length of the inserted text.
+    inserted_length = len(text) + 1  # +1 for the newline character
+    return req, inserted_length
 
 
-def upload_to_google_docs(final_header, user_table_data, dashboard_table_data, detailed_text, overall_summary,
-                          document_title="Weekly PR Dashboard"):
+def upload_to_google_docs(prs, overall_summary, date_str, user_lines, dashboard_lines, doc_title="Weekly PR Dashboard"):
     """
-    Creates a new Google Doc and inserts content using structured requests:
-      - A header section that includes an AI-generated overall summary and a plain header.
-      - Two tables (as plain text) for "Summary by User" and the dashboard.
-      - Detailed PR summaries as plain text.
-    The tables are formatted as plain text tables (using fixed-width formatting) and styled with a monospace font.
+    Create a new doc with:
+      - "Overall Summary" (HEADING_1) + summary text
+      - "Weekly PR Summary" (HEADING_1) + date
+      - "Summary by User" (HEADING_2) with bullet lines
+      - "PR Dashboard" (HEADING_2) with bullet lines
+      - "Detailed PR Summaries" section (per PR subheading)
+
+    Returns the doc ID.
     """
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -299,89 +219,121 @@ def upload_to_google_docs(final_header, user_table_data, dashboard_table_data, d
     SCOPES = ['https://www.googleapis.com/auth/documents']
     SERVICE_ACCOUNT_FILE = 'docs_token.json'
     creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-    service = build('docs', 'v1', credentials=creds)
+    docs_service = build('docs', 'v1', credentials=creds)
 
-    # Create the document.
-    doc_body = {"title": document_title}
-    doc = service.documents().create(body=doc_body).execute()
-    document_id = doc.get('documentId')
-    logger.info(f"Created Google Doc with ID: {document_id}")
+    # 1) Create document
+    doc_body = {"title": doc_title}
+    doc = docs_service.documents().create(body=doc_body).execute()
+    doc_id = doc.get("documentId")
+    logger.info(f"Created Google Doc with ID: {doc_id}")
 
     requests_list = []
     current_index = 1
 
-    # Insert Overall Summary header and overall summary.
-    header_text = "Overall Summary\n"
-    req, text_len = insert_plain_text_request(header_text, current_index)
+    # 2) Insert "Overall Summary" as heading
+    heading_1 = "Overall Summary"
+    # insert
+    req, text_len = insert_plain_text_request(heading_1, current_index)
     requests_list.append(req)
+    # apply heading style
+    requests_list.append({
+        "updateParagraphStyle": {
+            "range": {
+                "startIndex": current_index,
+                "endIndex": current_index + text_len - 1  # exclude trailing newline
+            },
+            "paragraphStyle": {"namedStyleType": "HEADING_1"},
+            "fields": "namedStyleType"
+        }
+    })
     current_index += text_len
 
+    # Insert overall summary text
     req, text_len = insert_plain_text_request(overall_summary, current_index)
     requests_list.append(req)
     current_index += text_len
 
-    # Insert plain header (Weekly PR Summary header).
-    req, text_len = insert_plain_text_request(final_header, current_index)
-    requests_list.append(req)
-    current_index += text_len
-
-    # Build plain text tables.
-    user_table_str = build_plain_table_string(user_table_data)
-    dashboard_table_str = build_plain_table_string(dashboard_table_data)
-
-    # Insert User Summary Table.
-    req, text_len = insert_plain_text_request(user_table_str, current_index)
-    requests_list.append(req)
-    # Apply monospace font to the table text.
-    requests_list.append({
-        "updateTextStyle": {
-            "range": {"startIndex": current_index, "endIndex": current_index + text_len},
-            "textStyle": {"weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}},
-            "fields": "weightedFontFamily"
-        }
-    })
-    current_index += text_len
-
-    # Insert a newline.
-    req, nl_len = insert_plain_text_request("\n", current_index)
-    requests_list.append(req)
-    current_index += nl_len
-
-    # Insert Dashboard Table.
-    req, text_len = insert_plain_text_request(dashboard_table_str, current_index)
+    # 3) Insert "Weekly PR Summary" as heading
+    heading_2 = "Weekly PR Summary"
+    req, txt_len = insert_plain_text_request(heading_2, current_index)
     requests_list.append(req)
     requests_list.append({
-        "updateTextStyle": {
-            "range": {"startIndex": current_index, "endIndex": current_index + text_len},
-            "textStyle": {"weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}},
-            "fields": "weightedFontFamily"
+        "updateParagraphStyle": {
+            "range": {
+                "startIndex": current_index,
+                "endIndex": current_index + txt_len - 1
+            },
+            "paragraphStyle": {"namedStyleType": "HEADING_1"},
+            "fields": "namedStyleType"
         }
     })
-    current_index += text_len
+    current_index += txt_len
 
-    # Insert a newline.
-    req, nl_len = insert_plain_text_request("\n", current_index)
+    # Insert date range
+    date_line = f"Date Range: {date_str}\n"
+    req, txt_len = insert_plain_text_request(date_line, current_index)
     requests_list.append(req)
-    current_index += nl_len
+    current_index += txt_len
 
-    # Insert Detailed PR Summaries.
-    req, text_len = insert_plain_text_request(detailed_text, current_index)
+    # 4) Insert "Summary by User" as heading
+    heading_user = "Summary by User"
+    req, h_len = insert_plain_text_request(heading_user, current_index)
     requests_list.append(req)
-    current_index += text_len
+    requests_list.append({
+        "updateParagraphStyle": {
+            "range": {
+                "startIndex": current_index,
+                "endIndex": current_index + h_len - 1
+            },
+            "paragraphStyle": {"namedStyleType": "HEADING_2"},
+            "fields": "namedStyleType"
+        }
+    })
+    current_index += h_len
 
-    # Execute the batch update.
-    service.documents().batchUpdate(documentId=document_id, body={"requests": requests_list}).execute()
-    logger.info("Content and tables uploaded to Google Docs successfully!")
+    # Insert bullet lines for user summary
+    user_reqs, new_index = create_bullet_lines(user_lines, current_index)
+    requests_list.extend(user_reqs)
+    current_index = new_index
 
-    doc_url = f"https://docs.google.com/document/d/{document_id}"
-    logger.info(f"Google Doc URL: {doc_url}")
-    return document_id
+    # 5) Insert "PR Dashboard" as heading
+    heading_dash = "PR Dashboard"
+    req, h_len2 = insert_plain_text_request(heading_dash, current_index)
+    requests_list.append(req)
+    requests_list.append({
+        "updateParagraphStyle": {
+            "range": {
+                "startIndex": current_index,
+                "endIndex": current_index + h_len2 - 1
+            },
+            "paragraphStyle": {"namedStyleType": "HEADING_2"},
+            "fields": "namedStyleType"
+        }
+    })
+    current_index += h_len2
+
+    # Insert bullet lines for dashboard
+    dash_reqs, new_index = create_bullet_lines(dashboard_lines, current_index)
+    requests_list.extend(dash_reqs)
+    current_index = new_index
+
+    # 6) Insert Detailed Summaries section
+    detail_section_reqs, final_index = generate_detailed_pr_summaries_section(prs, current_index)
+    requests_list.extend(detail_section_reqs)
+    current_index = final_index
+
+    # 7) Execute the requests in batch
+    docs_service.documents().batchUpdate(
+        documentId=doc_id, body={"requests": requests_list}
+    ).execute()
+    logger.info("All content uploaded with headings & bullet lists.")
+    doc_url = f"https://docs.google.com/document/d/{doc_id}"
+    logger.info(f"Document URL: {doc_url}")
+    return doc_id
 
 
-def share_document_with_email(document_id, email, role="writer"):
-    """
-    Shares the document with the specified email using the Google Drive API.
-    """
+def share_document_with_email(document_id, email):
+    """Shares the doc with the given email, as 'writer' role, using the Google Drive API."""
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
 
@@ -389,57 +341,45 @@ def share_document_with_email(document_id, email, role="writer"):
     creds = service_account.Credentials.from_service_account_file("docs_token.json", scopes=DRIVE_SCOPES)
     drive_service = build('drive', 'v3', credentials=creds)
 
-    permission = {
-        'type': 'user',
-        'role': role,
-        'emailAddress': email
-    }
-    try:
-        drive_service.permissions().create(
-            fileId=document_id,
-            body=permission,
-            sendNotificationEmail=False
-        ).execute()
-        logger.info(f"Shared document {document_id} with {email} as {role}.")
-    except Exception as e:
-        logger.error(f"Failed to share document: {e}")
+    permission = {"type": "user", "role": "writer", "emailAddress": email}
+    drive_service.permissions().create(
+        fileId=document_id,
+        body=permission,
+        sendNotificationEmail=False
+    ).execute()
+    logger.info(f"Shared doc {document_id} with {email} as writer.")
 
 
 def main():
+    # 1) Get username & date range
     username = get_authenticated_username()
-    logger.info(f"Starting PR dashboard generation for user: {username}")
-    last_week_start, last_week_end = get_date_range()
-    start_date_str = last_week_start.strftime("%Y-%m-%d")
-    end_date_str = last_week_end.strftime("%Y-%m-%d")
-    logger.info(f"Using date range: {start_date_str} to {end_date_str}")
+    start_date, end_date = get_date_range()
+    date_str = f"{start_date} to {end_date}"
 
-    all_prs = fetch_all_prs_by_user(username, start_date_str, end_date_str)
-    logger.info(f"Found {len(all_prs)} PRs by {username} in the given period.")
+    # 2) Fetch all PRs
+    all_prs = fetch_all_prs_by_user(username, start_date, end_date)
 
-    # Generate an AI-based overall summary of all PRs.
+    # 3) AI-based overall summary
     overall_summary = generate_overall_summary(all_prs)
 
-    # Build plain text header.
-    final_plain_header = (
-            "Weekly PR Summary\n" +
-            f"Date Range: {start_date_str} to {end_date_str}\n\n"
+    # 4) Build bullet lines for user summary
+    user_lines = generate_user_summary_bullets(all_prs)
+
+    # 5) Build bullet lines for PR dashboard
+    dashboard_lines = generate_dashboard_bullets(all_prs)
+
+    # 6) Create doc with headings, bullet lines, & detailed summaries
+    doc_id = upload_to_google_docs(
+        prs=all_prs,
+        overall_summary=overall_summary,
+        date_str=date_str,
+        user_lines=user_lines,
+        dashboard_lines=dashboard_lines,
+        doc_title="Weekly PR Dashboard"
     )
 
-    # Build table data for "Summary by User".
-    user_table_data = generate_user_summary_table(all_prs)
-
-    # Build table data for the dashboard.
-    dashboard_table_data = generate_dashboard_table(all_prs, start_date_str, end_date_str)
-
-    # Generate detailed PR summaries as plain text.
-    detailed_text = generate_detailed_pr_summaries(all_prs)
-
-    # Upload content to Google Docs.
-    document_id = upload_to_google_docs(final_plain_header, user_table_data, dashboard_table_data, detailed_text,
-                                        overall_summary, document_title="Weekly PR Dashboard")
-    logger.info(f"Dashboard and summaries stored in Google Docs with Document ID: {document_id}")
-
-    share_document_with_email(document_id, os.getenv("SHARE_EMAIL"), role="writer")
+    # 7) Share doc
+    share_document_with_email(doc_id, SHARE_EMAIL)
 
 
 if __name__ == "__main__":
