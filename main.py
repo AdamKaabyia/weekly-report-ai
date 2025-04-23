@@ -1,9 +1,10 @@
-
 import os
 import time
 import requests
 import datetime
 import logging
+import json
+import re
 from collections import defaultdict
 from dotenv import load_dotenv
 
@@ -13,7 +14,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Granite API endpoint (e.g., provided by your Granite service)
+# Granite API endpoint (provided by your Granite service)
 GRANITE_ENDPOINT = os.getenv("GRANITE_ENDPOINT")
 if not GRANITE_ENDPOINT:
     logger.error("GRANITE_ENDPOINT is not set. Exiting.")
@@ -25,25 +26,51 @@ if not GITHUB_TOKEN:
     logger.error("GITHUB_TOKEN is not set. Exiting.")
     exit(1)
 
+# Load the email to share with from environment variable
+SHARE_EMAIL = os.getenv("SHARE_EMAIL")
+if not SHARE_EMAIL:
+    logger.error("SHARE_EMAIL is not set. Exiting.")
+    exit(1)
+
+
+def get_authenticated_username():
+    """
+    Fetches the username of the authenticated user from GitHub.
+    """
+    url = "https://api.github.com/user"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"token {GITHUB_TOKEN}"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        user_data = response.json()
+        username = user_data.get("login")
+        if username:
+            logger.info(f"Authenticated as: {username}")
+            return username
+    logger.error("Failed to fetch authenticated user info from GitHub")
+    exit(1)
+
+
 def get_date_range():
     """
     Computes the start and end dates for last week.
-    Last week is defined as:
-      - Start: Previous Monday (7 days ago)
-      - End: Previous Sunday (1 day ago)
+    For testing purposes, the start date is set to 1 day ago and the end date to today.
+    (Change the timedelta to 7 for production if needed.)
     Returns:
         (start_date, end_date) as datetime.date objects.
     """
     today = datetime.datetime.now().date()
-    last_week_start = today - datetime.timedelta(days=7)
-    last_week_end = today - datetime.timedelta(days=1)
+    last_week_start = today - datetime.timedelta(days=10)
+    last_week_end = today - datetime.timedelta(days=0)
     logger.info(f"Calculated date range: {last_week_start} to {last_week_end}")
     return last_week_start, last_week_end
 
+
 def fetch_all_prs_by_user(username, start_date, end_date):
     """
-    Fetches all pull requests created by the given user across all repositories
-    within the specified date range using the GitHub search API.
+    Fetches all pull requests created by the given user within the specified date range.
     """
     headers = {
         "Accept": "application/vnd.github+json",
@@ -76,10 +103,10 @@ def fetch_all_prs_by_user(username, start_date, end_date):
     logger.info(f"Total PRs fetched: {len(prs)}")
     return prs
 
+
 def get_pr_status(pr):
     """
-    Determines the status of a pull request.
-    Returns one of: "open", "closed", or "merged".
+    Determines the status of a pull request: "open", "closed", or "merged".
     """
     pr_number = pr.get("number", "unknown")
     status = pr.get("state", "unknown")
@@ -106,9 +133,10 @@ def get_pr_status(pr):
     logger.debug(f"PR #{pr_number}: Final status is '{status}'.")
     return status
 
+
 def generate_pr_detailed_summary(pr):
     """
-    Uses the Granite-8B-Code-Instruct-128k API to generate a detailed summary for a single PR.
+    Uses the Granite API to generate a detailed summary for a single PR.
     """
     pr_number = pr.get("number", "unknown")
     title = pr.get("title", "No title")
@@ -146,10 +174,10 @@ def generate_pr_detailed_summary(pr):
         logger.error(f"Error calling Granite API for PR #{pr_number}: {response.status_code} {response.text}")
         return ""
 
+
 def generate_dashboard(prs, start_date, end_date):
     """
     Generates a Markdown-formatted dashboard for all PR items.
-    Columns: Repo, PR Number (as a link), Title, Author, Created At, Status.
     """
     logger.info("Generating dashboard for all PRs...")
     md = f"# Weekly PR Dashboard\n\n"
@@ -158,8 +186,10 @@ def generate_dashboard(prs, start_date, end_date):
         md += "No pull requests were created in this period.\n"
         return md
 
-    md += ("| Repo | PR Number | Title | Author | Created At | Status |\n"
-           "|------|-----------|-------|--------|------------|--------|\n")
+    md += (
+        "| Repo | PR Number | Title | Author | Created At | Status |\n"
+        "|------|-----------|-------|--------|------------|--------|\n"
+    )
     for pr in prs:
         repo_url = pr.get("repository_url", "")
         repo = "/".join(repo_url.split("/")[-2:]) if repo_url else "unknown"
@@ -174,10 +204,10 @@ def generate_dashboard(prs, start_date, end_date):
     logger.info("Dashboard generation complete.")
     return md
 
+
 def generate_detailed_pr_summaries(prs):
     """
-    Generates detailed summaries for each PR.
-    Each PR is given its own heading with a detailed summary.
+    Generates detailed summaries for each PR with separate headings.
     """
     logger.info("Generating detailed summaries for each PR...")
     md = "\n# Detailed PR Summaries\n\n"
@@ -196,8 +226,133 @@ def generate_detailed_pr_summaries(prs):
     logger.info("Detailed PR summaries generated.")
     return md
 
+
+def convert_markdown_to_requests(markdown_text):
+    """
+    Converts a simple markdown text into a list of Google Docs API requests for headings and paragraphs.
+    Lines that start with '#' are treated as headings.
+    Other lines are inserted as normal paragraphs.
+    (This converter is basic and does not handle tables or lists fully.)
+    """
+    requests_list = []
+    lines = markdown_text.splitlines()
+    current_index = 1  # Google Docs index starts at 1
+
+    for line in lines:
+        if not line.strip():
+            # Insert a newline for empty lines.
+            requests_list.append({
+                "insertText": {
+                    "location": {"index": current_index},
+                    "text": "\n"
+                }
+            })
+            current_index += 1
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.*)", line)
+        if heading_match:
+            hashes, heading_text = heading_match.groups()
+            text_to_insert = heading_text + "\n"
+            # Insert heading text.
+            requests_list.append({
+                "insertText": {
+                    "location": {"index": current_index},
+                    "text": text_to_insert
+                }
+            })
+            # Apply the appropriate heading style.
+            heading_level = min(len(hashes), 6)
+            requests_list.append({
+                "updateParagraphStyle": {
+                    "range": {
+                        "startIndex": current_index,
+                        "endIndex": current_index + len(text_to_insert)
+                    },
+                    "paragraphStyle": {"namedStyleType": f"HEADING_{heading_level}"},
+                    "fields": "namedStyleType"
+                }
+            })
+            current_index += len(text_to_insert)
+        else:
+            # Insert normal text followed by a newline.
+            text_to_insert = line + "\n"
+            requests_list.append({
+                "insertText": {
+                    "location": {"index": current_index},
+                    "text": text_to_insert
+                }
+            })
+            current_index += len(text_to_insert)
+
+    return requests_list
+
+
+def upload_to_google_docs(final_output, document_title="Weekly PR Dashboard"):
+    """
+    Creates a new Google Doc and inserts the provided content using structured requests.
+    This function uses service account credentials stored in docs_token.json.
+    The Markdown content is converted into a set of Google Docs requests for better formatting.
+    """
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    SCOPES = ['https://www.googleapis.com/auth/documents']
+    SERVICE_ACCOUNT_FILE = 'docs_token.json'
+    creds = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    service = build('docs', 'v1', credentials=creds)
+
+    # Create a new document.
+    doc_body = {"title": document_title}
+    doc = service.documents().create(body=doc_body).execute()
+    document_id = doc.get('documentId')
+    logger.info(f"Created Google Doc with ID: {document_id}")
+
+    # Convert Markdown to structured Google Docs requests.
+    requests_list = convert_markdown_to_requests(final_output)
+    if requests_list:
+        service.documents().batchUpdate(
+            documentId=document_id, body={"requests": requests_list}
+        ).execute()
+    logger.info("Content uploaded to Google Docs successfully!")
+
+    # Construct the public URL for the document.
+    doc_url = f"https://docs.google.com/document/d/{document_id}"
+    logger.info(f"Google Doc URL: {doc_url}")
+
+    return document_id
+
+
+def share_document_with_email(document_id, email, role="writer"):
+    """
+    Shares the document with the specified email using the Google Drive API.
+    """
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive']
+    creds = service_account.Credentials.from_service_account_file("docs_token.json", scopes=DRIVE_SCOPES)
+    drive_service = build('drive', 'v3', credentials=creds)
+
+    permission = {
+        'type': 'user',
+        'role': role,
+        'emailAddress': email
+    }
+    try:
+        drive_service.permissions().create(
+            fileId=document_id,
+            body=permission,
+            sendNotificationEmail=False
+        ).execute()
+        logger.info(f"Shared document {document_id} with {email} as {role}.")
+    except Exception as e:
+        logger.error(f"Failed to share document: {e}")
+
+
 def main():
-    username ="adamkaabyia" #"Shai1-Levi"
+    username = get_authenticated_username()
     logger.info(f"Starting PR dashboard generation for user: {username}")
     last_week_start, last_week_end = get_date_range()
     start_date_str = last_week_start.strftime("%Y-%m-%d")
@@ -207,28 +362,23 @@ def main():
     all_prs = fetch_all_prs_by_user(username, start_date_str, end_date_str)
     logger.info(f"Found {len(all_prs)} PRs by {username} in the given period.")
 
-    # Generate the dashboard (user-specific)
+    # Generate the dashboard and summaries (in Markdown format)
     dashboard_md = generate_dashboard(all_prs, start_date_str, end_date_str)
-    # Generate detailed summaries for each PR
     detailed_summaries_md = generate_detailed_pr_summaries(all_prs)
 
-    # Overall Concise Summary (fixed text as requested)
     overall_concise_summary = (
         "# Overall Concise Summary\n\n"
-        "The pull request is a part of a larger deployment process aimed at improving security and authentication for publishing site content.\n"
-        "The changes made in the pull request focus on enhancing the user experience, improving readability, and ensuring the dashboard is secure and accessible to authorized users.\n"
+        "The pull request is part of a larger deployment process aimed at improving security and authentication for publishing site content.\n"
+        "The changes made focus on enhancing user experience, improving readability, and ensuring that only authorized users can update content.\n"
         "The pull request has been merged and deployed, and the changes are now live on the test matrix dashboard.\n"
-        "The pull request may require additional testing and documentation to ensure that the deployment process is working as expected and that only authorized users can publish updated site content.\n"
-        "The pull request can be improved further by addressing any remaining bugs or incorporating new features that enhance the overall functionality of the dashboard.\n"
+        "Further improvements might include additional testing or new features to enhance functionality.\n"
     )
 
-    # Weekly PR Summary section
     weekly_summary_header = (
         "# Weekly PR Summary\n\n"
         f"**Date Range:** {start_date_str} to {end_date_str}\n\n"
         "## Summary by User\n\n"
     )
-    # Generate a summary by user table
     user_counts = defaultdict(int)
     for pr in all_prs:
         user = pr.get("user", {}).get("login", "unknown")
@@ -237,18 +387,18 @@ def main():
     for user, count in user_counts.items():
         user_table += f"| {user} | {count} |\n"
 
-    # Assemble final output with all sections:
     final_output = (
-        overall_concise_summary + "\n" +
-        weekly_summary_header + user_table + "\n" +
-        dashboard_md + "\n" +
-        detailed_summaries_md
+            overall_concise_summary + "\n" +
+            weekly_summary_header + user_table + "\n" +
+            dashboard_md + "\n" +
+            detailed_summaries_md
     )
 
-    output_filename = "dashboard.md"
-    with open(output_filename, "w", encoding="utf-8") as f:
-        f.write(final_output)
-    logger.info(f"Dashboard and detailed summaries stored in {output_filename}")
+    document_id = upload_to_google_docs(final_output, document_title="Weekly PR Dashboard")
+    logger.info(f"Dashboard and summaries stored in Google Docs with Document ID: {document_id}")
+    for email in  os.getenv("SHARE_EMAIL").split(","):
+        share_document_with_email(document_id,email, role="writer")
+
 
 if __name__ == "__main__":
     main()
