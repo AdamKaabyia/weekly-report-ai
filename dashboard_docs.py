@@ -15,17 +15,19 @@ from logger import logger
 load_dotenv()
 
 
-# Email to share the doc with
-SHARE_EMAIL = os.getenv("SHARE_EMAIL")
-if not SHARE_EMAIL:
-    logger.error("SHARE_EMAIL is not set. Exiting.")
+
+# load all emails as a comma‑separated list
+raw = os.getenv("SHARE_EMAILS", "")
+SHARE_EMAILS = [e.strip() for e in raw.split(",") if e.strip()]
+if not SHARE_EMAILS:
+    logger.error("SHARE_EMAILS is not set or empty. Exiting.")
     exit(1)
 
 
 def get_date_range():
     """Compute date range: 1 day ago to today (for testing)."""
     today = datetime.datetime.now().date()
-    last_date = today - datetime.timedelta(days=7)
+    last_date = today - datetime.timedelta(days=30)
     logger.info(f"Calculated date range: {last_date} to {today}")
     return last_date, today
 
@@ -379,8 +381,9 @@ def main():
     )
 
     # 7) Share doc
-    share_document_with_email(doc_id, SHARE_EMAIL)
-
+    for email in SHARE_EMAILS:
+        share_document_with_email(doc_id, email)
+        logger.info(f"Shared doc {doc_id} with: {', '.join(SHARE_EMAILS)}")
 
 if __name__ == "__main__":
     main()

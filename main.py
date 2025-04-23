@@ -62,7 +62,7 @@ def get_date_range():
         (start_date, end_date) as datetime.date objects.
     """
     today = datetime.datetime.now().date()
-    last_week_start = today - datetime.timedelta(days=7)
+    last_week_start = today - datetime.timedelta(days=10)
     last_week_end = today - datetime.timedelta(days=0)
     logger.info(f"Calculated date range: {last_week_start} to {last_week_end}")
     return last_week_start, last_week_end
@@ -396,8 +396,8 @@ def main():
 
     document_id = upload_to_google_docs(final_output, document_title="Weekly PR Dashboard")
     logger.info(f"Dashboard and summaries stored in Google Docs with Document ID: {document_id}")
-
-    share_document_with_email(document_id, os.getenv("SHARE_EMAIL"), role="writer")
+    for email in  os.getenv("SHARE_EMAIL").split(","):
+        share_document_with_email(document_id,email, role="writer")
 
 
 if __name__ == "__main__":
